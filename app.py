@@ -4,7 +4,6 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-sudo pip install BeautifulSoup4
 from bs4 import BeautifulSoup4
 
 
