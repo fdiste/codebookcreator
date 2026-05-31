@@ -4,6 +4,7 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+sudo apt-get install python3-bs4
 from bs4 import beautifulsoup4
 
 
