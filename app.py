@@ -4,8 +4,8 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-sudo apt-get install python3-bs4
-from bs4 import beautifulsoup4
+sudo pip install BeautifulSoup4
+from bs4 import BeautifulSoup4
 
 
 st.set_page_config(page_title="QSF Codebook Generator", layout="wide")
