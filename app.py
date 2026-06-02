@@ -4,7 +4,7 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-from beautifulsoup4 import BeautifulSoup
+from bs4 import BeautifulSoup
 
 
 st.set_page_config(page_title="QSF Codebook Generator", layout="wide")
