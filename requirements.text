@@ -1,4 +1,5 @@
+streamlit
 pandas
-bs4
+beautifulsoup4
 xlsxwriter
 openpyxl
