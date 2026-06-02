@@ -1,5 +1,5 @@
 streamlit
 pandas
-beautifulsoup4
+beautifulsoup4==4.9.0
 xlsxwriter
 openpyxl
