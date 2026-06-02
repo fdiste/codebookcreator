@@ -203,7 +203,7 @@ def parse_qsf(qsf_json):
                 "QID": qid,
             })
 
-        # ------------------------------------------------------------
+         # ------------------------------------------------------------
         # Matrix/table questions
         # ------------------------------------------------------------
         elif question_type == "Matrix":
@@ -211,34 +211,71 @@ def parse_qsf(qsf_json):
             answers = payload.get("Answers", {})
             recode_values = payload.get("RecodeValues", {})
 
+            # Build the left side of the codebook:
+            # parent matrix variable first, then each matrix row variable.
+            matrix_variables = []
+
+            matrix_variables.append({
+                "VARIABLE NAME": variable_name,
+                "QUESTION": question_text,
+            })
+
             for choice_id, choice_info in choices.items():
                 row_text = clean_html(choice_info.get("Display", ""))
 
-                # Try to use Qualtrics variable naming for matrix rows if available.
                 matrix_variable_name = get_choice_variable_name(
                     payload,
                     variable_name,
                     choice_id
                 )
 
-                full_question = question_text
-                if row_text:
-                    full_question = f"{question_text} — {row_text}"
+                matrix_variables.append({
+                    "VARIABLE NAME": matrix_variable_name,
+                    "QUESTION": row_text,
+                })
 
-                for answer_id, answer_info in answers.items():
-                    value = recode_values.get(str(answer_id), str(answer_id))
-                    label = clean_html(answer_info.get("Display", ""))
+            # Build the right side of the codebook:
+            # values and labels listed once.
+            scale_values = []
 
-                    rows.append({
-                        "VARIABLE NAME": matrix_variable_name,
-                        "QUESTION": full_question,
-                        "VALUE": value,
-                        "LABEL": label,
-                        "QUESTION TYPE": question_type,
-                        "SELECTOR": selector,
-                        "QID": qid,
-                    })
+            for answer_id, answer_info in answers.items():
+                value = recode_values.get(str(answer_id), str(answer_id))
+                label = clean_html(answer_info.get("Display", ""))
 
+                scale_values.append({
+                    "VALUE": value,
+                    "LABEL": label,
+                })
+
+            # Combine the left side and right side row-by-row.
+            # This keeps matrix variables directly under the parent variable
+            # while listing the value/label scale only once.
+            max_rows = max(len(matrix_variables), len(scale_values))
+
+            for i in range(max_rows):
+                if i < len(matrix_variables):
+                    var_name = matrix_variables[i]["VARIABLE NAME"]
+                    q_text = matrix_variables[i]["QUESTION"]
+                else:
+                    var_name = ""
+                    q_text = ""
+
+                if i < len(scale_values):
+                    value = scale_values[i]["VALUE"]
+                    label = scale_values[i]["LABEL"]
+                else:
+                    value = ""
+                    label = ""
+
+                rows.append({
+                    "VARIABLE NAME": var_name,
+                    "QUESTION": q_text,
+                    "VALUE": value,
+                    "LABEL": label,
+                    "QUESTION TYPE": question_type,
+                    "SELECTOR": selector,
+                    "QID": qid,
+                })
         # ------------------------------------------------------------
         # Drill down questions - basic placeholder/fallback
         # ------------------------------------------------------------
