@@ -26,7 +26,7 @@ st.info(
 
 
 # ------------------------------------------------------------
-# Helper functions
+# Helper functions: text cleaning
 # ------------------------------------------------------------
 
 def clean_html(text):
@@ -46,10 +46,156 @@ def clean_html(text):
     return clean_text
 
 
+# ------------------------------------------------------------
+# Helper functions: QSF survey order
+# ------------------------------------------------------------
+
+def get_blocks_from_qsf(qsf_json):
+    """
+    Extracts Qualtrics blocks from the QSF.
+
+    QSF block structure can vary. Sometimes the BL payload is a list.
+    Sometimes it is a dictionary with a 'Blocks' key.
+    This function tries to handle the common versions.
+    """
+    blocks = []
+
+    for element in qsf_json.get("SurveyElements", []):
+        if element.get("Element") != "BL":
+            continue
+
+        payload = element.get("Payload", [])
+
+        # Common case: Payload itself is a list of block objects.
+        if isinstance(payload, list):
+            blocks.extend(payload)
+
+        # Alternate case: Payload is a dict containing Blocks.
+        elif isinstance(payload, dict):
+            if isinstance(payload.get("Blocks"), list):
+                blocks.extend(payload.get("Blocks"))
+
+            # Less common: Payload itself may act like a block.
+            if payload.get("BlockElements"):
+                blocks.append(payload)
+
+    return blocks
+
+
+def get_block_ids_from_survey_flow(qsf_json):
+    """
+    Attempts to get block order from Qualtrics Survey Flow.
+
+    This is more reliable than raw SurveyElements order when the survey has
+    multiple blocks. For complex randomizers/branches, this gives a reasonable
+    design-order approximation.
+    """
+    block_ids = []
+
+    def walk_flow_items(items):
+        if not isinstance(items, list):
+            return
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("Type")
+            item_id = item.get("ID")
+
+            if item_type == "Block" and item_id:
+                if item_id not in block_ids:
+                    block_ids.append(item_id)
+
+            # Survey Flow items can contain nested Flow lists.
+            if "Flow" in item:
+                walk_flow_items(item.get("Flow"))
+
+            # Some randomizer/branch structures have nested items elsewhere.
+            for key in ["SubFlow", "FlowItems"]:
+                if key in item:
+                    walk_flow_items(item.get(key))
+
+    for element in qsf_json.get("SurveyElements", []):
+        if element.get("Element") == "FL":
+            payload = element.get("Payload", {})
+
+            if isinstance(payload, dict):
+                walk_flow_items(payload.get("Flow", []))
+            elif isinstance(payload, list):
+                walk_flow_items(payload)
+
+    return block_ids
+
+
+def get_ordered_question_ids(qsf_json):
+    """
+    Attempts to get question order from Qualtrics blocks and survey flow.
+
+    Preferred order:
+    1. Survey Flow block order, if available
+    2. Block order from the BL element
+    3. Fallback happens in parse_qsf if this returns no IDs
+
+    Note: surveys with randomization, branches, and complex logic may not have
+    one fixed respondent-facing order. This gives a design-order approximation.
+    """
+    blocks = get_blocks_from_qsf(qsf_json)
+
+    block_id_to_qids = {}
+    block_order_from_bl = []
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+
+        block_id = block.get("ID") or block.get("BlockID")
+
+        if block_id and block_id not in block_order_from_bl:
+            block_order_from_bl.append(block_id)
+
+        qids = []
+
+        for block_element in block.get("BlockElements", []):
+            if not isinstance(block_element, dict):
+                continue
+
+            if block_element.get("Type") == "Question":
+                qid = block_element.get("QuestionID")
+                if qid:
+                    qids.append(qid)
+
+        if block_id:
+            block_id_to_qids[block_id] = qids
+
+    ordered_qids = []
+
+    # First try Survey Flow order.
+    flow_block_ids = get_block_ids_from_survey_flow(qsf_json)
+
+    if flow_block_ids:
+        for block_id in flow_block_ids:
+            for qid in block_id_to_qids.get(block_id, []):
+                if qid not in ordered_qids:
+                    ordered_qids.append(qid)
+
+    # Then add blocks that were not found in Survey Flow.
+    for block_id in block_order_from_bl:
+        for qid in block_id_to_qids.get(block_id, []):
+            if qid not in ordered_qids:
+                ordered_qids.append(qid)
+
+    return ordered_qids
+
+
+# ------------------------------------------------------------
+# Helper functions: codebook rows
+# ------------------------------------------------------------
+
 def get_choice_variable_name(payload, base_variable_name, choice_id):
     """
-    For multi-select and matrix questions, Qualtrics may store custom variable names
-    for each answer option or matrix row in different places.
+    For multi-select and matrix questions, Qualtrics may store custom variable
+    names for each answer option or matrix row in different places.
     """
 
     choice_id = str(choice_id)
@@ -91,6 +237,7 @@ def blank_row():
         "QUESTION TYPE": "",
         "SELECTOR": "",
         "QID": "",
+        "IS MAIN QUESTION": False,
     }
 
 
@@ -101,7 +248,8 @@ def make_row(
     label,
     question_type,
     selector,
-    qid
+    qid,
+    is_main_question=False
 ):
     """
     Creates one standard codebook row.
@@ -114,6 +262,7 @@ def make_row(
         "QUESTION TYPE": question_type,
         "SELECTOR": selector,
         "QID": qid,
+        "IS MAIN QUESTION": is_main_question,
     }
 
 
@@ -121,17 +270,17 @@ def combine_left_and_right(left_items, right_items, question_type, selector, qid
     """
     Combines left-side variable/question items with right-side value/label items.
 
-    This is useful for matrix and multi-select questions where the left side
-    lists variables/items and the right side lists a shared response scale.
+    Used for matrix and multi-select questions where the left side lists
+    variables/items and the right side lists a shared response scale.
 
-    Example output:
+    Example:
 
-    VARIABLE NAME    QUESTION                 VALUE    LABEL
-    Prices           Agreement question        1       Strongly disagree
-    PricesHigh       Prices are higher...      2       Disagree
-    PricesQuality    Quality is good...        3       Neither agree nor disagree
-                                              4       Agree
-                                              5       Strongly agree
+    VARIABLE NAME    QUESTION                  VALUE    LABEL
+    Prices           Main matrix question       1       Strongly disagree
+    PricesHigh       Prices are higher...       2       Disagree
+    PricesQuality    Quality is good...         3       Neither agree nor disagree
+                                                4       Agree
+                                                5       Strongly agree
     """
     rows = []
 
@@ -141,9 +290,11 @@ def combine_left_and_right(left_items, right_items, question_type, selector, qid
         if i < len(left_items):
             variable_name = left_items[i].get("VARIABLE NAME", "")
             question = left_items[i].get("QUESTION", "")
+            is_main_question = left_items[i].get("IS MAIN QUESTION", False)
         else:
             variable_name = ""
             question = ""
+            is_main_question = False
 
         if i < len(right_items):
             value = right_items[i].get("VALUE", "")
@@ -159,28 +310,70 @@ def combine_left_and_right(left_items, right_items, question_type, selector, qid
             label=label,
             question_type=question_type,
             selector=selector,
-            qid=qid
+            qid=qid,
+            is_main_question=is_main_question
         ))
 
     return rows
 
 
+# ------------------------------------------------------------
+# Main parser
+# ------------------------------------------------------------
+
 def parse_qsf(qsf_json):
     """
     Reads a Qualtrics QSF JSON file and creates codebook rows.
+
+    This version attempts to follow survey order using Qualtrics block/survey
+    flow order when available.
     """
     all_rows = []
 
-    survey_elements = qsf_json.get("SurveyElements", [])
+    # Build dictionary of question elements by QID.
+    question_elements_by_qid = {}
+    raw_question_elements = []
 
-    for element in survey_elements:
-        # In Qualtrics QSF files, survey questions usually have Element == "SQ"
+    for element in qsf_json.get("SurveyElements", []):
         if element.get("Element") != "SQ":
             continue
 
         payload = element.get("Payload", {})
+        qid = payload.get("QuestionID") or element.get("PrimaryAttribute")
 
-        qid = payload.get("QuestionID", "")
+        if qid:
+            question_elements_by_qid[qid] = element
+
+        raw_question_elements.append(element)
+
+    # Try to order questions using Qualtrics block/survey flow order.
+    ordered_qids = get_ordered_question_ids(qsf_json)
+
+    ordered_elements = []
+
+    if ordered_qids:
+        for qid in ordered_qids:
+            if qid in question_elements_by_qid:
+                ordered_elements.append(question_elements_by_qid[qid])
+
+        # Add any question elements not found in blocks, just in case.
+        already_added_qids = set(ordered_qids)
+
+        for element in raw_question_elements:
+            payload = element.get("Payload", {})
+            qid = payload.get("QuestionID") or element.get("PrimaryAttribute")
+
+            if qid not in already_added_qids:
+                ordered_elements.append(element)
+    else:
+        # Fallback to raw SurveyElements order.
+        ordered_elements = raw_question_elements
+
+    # Parse questions in order.
+    for element in ordered_elements:
+        payload = element.get("Payload", {})
+
+        qid = payload.get("QuestionID") or element.get("PrimaryAttribute", "")
         question_type = payload.get("QuestionType", "")
         selector = payload.get("Selector", "")
 
@@ -212,6 +405,7 @@ def parse_qsf(qsf_json):
                     {
                         "VARIABLE NAME": variable_name,
                         "QUESTION": question_text,
+                        "IS MAIN QUESTION": True,
                     }
                 ]
 
@@ -227,6 +421,7 @@ def parse_qsf(qsf_json):
                     left_items.append({
                         "VARIABLE NAME": option_variable_name,
                         "QUESTION": option_label,
+                        "IS MAIN QUESTION": False,
                     })
 
                 # RIGHT SIDE:
@@ -265,10 +460,12 @@ def parse_qsf(qsf_json):
                     if first_row:
                         row_variable_name = variable_name
                         row_question = question_text
+                        is_main_question = True
                         first_row = False
                     else:
                         row_variable_name = ""
                         row_question = ""
+                        is_main_question = False
 
                     question_rows.append(make_row(
                         variable_name=row_variable_name,
@@ -277,7 +474,8 @@ def parse_qsf(qsf_json):
                         label=label,
                         question_type=question_type,
                         selector=selector,
-                        qid=qid
+                        qid=qid,
+                        is_main_question=is_main_question
                     ))
 
         # ------------------------------------------------------------
@@ -291,7 +489,8 @@ def parse_qsf(qsf_json):
                 label="",
                 question_type=question_type,
                 selector=selector,
-                qid=qid
+                qid=qid,
+                is_main_question=True
             ))
 
         # ------------------------------------------------------------
@@ -308,6 +507,7 @@ def parse_qsf(qsf_json):
                 {
                     "VARIABLE NAME": variable_name,
                     "QUESTION": question_text,
+                    "IS MAIN QUESTION": True,
                 }
             ]
 
@@ -323,6 +523,7 @@ def parse_qsf(qsf_json):
                 left_items.append({
                     "VARIABLE NAME": matrix_variable_name,
                     "QUESTION": row_text,
+                    "IS MAIN QUESTION": False,
                 })
 
             # RIGHT SIDE:
@@ -359,7 +560,25 @@ def parse_qsf(qsf_json):
                 label="[drill-down question - needs review]",
                 question_type=question_type,
                 selector=selector,
-                qid=qid
+                qid=qid,
+                is_main_question=True
+            ))
+
+        # ------------------------------------------------------------
+        # Descriptive text / instructions
+        # ------------------------------------------------------------
+        elif question_type == "DB":
+            # Descriptive blocks are usually instructions, not variables.
+            # Keep them in the output, but mark them clearly.
+            question_rows.append(make_row(
+                variable_name="",
+                question=question_text,
+                value="",
+                label="[descriptive text / instruction]",
+                question_type=question_type,
+                selector=selector,
+                qid=qid,
+                is_main_question=True
             ))
 
         # ------------------------------------------------------------
@@ -373,7 +592,8 @@ def parse_qsf(qsf_json):
                 label="",
                 question_type=question_type,
                 selector=selector,
-                qid=qid
+                qid=qid,
+                is_main_question=True
             ))
 
         # Add this question's rows to the full codebook.
@@ -390,18 +610,29 @@ def parse_qsf(qsf_json):
     return pd.DataFrame(all_rows)
 
 
+# ------------------------------------------------------------
+# Excel export
+# ------------------------------------------------------------
+
 def dataframe_to_excel(df):
     """
-    Creates an Excel file with bold question text.
+    Creates an Excel file where only the main question's variable name
+    and question text are bolded.
+
     CSV cannot support bold formatting, so this is for Excel downloads.
     """
     output = BytesIO()
 
     core_columns = ["VARIABLE NAME", "QUESTION", "VALUE", "LABEL"]
-    core_df = df[core_columns].copy()
+    export_df = df[core_columns].copy()
+
+    if "IS MAIN QUESTION" in df.columns:
+        main_question_flags = df["IS MAIN QUESTION"].fillna(False).astype(bool).tolist()
+    else:
+        main_question_flags = [False] * len(df)
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        core_df.to_excel(writer, index=False, sheet_name="Codebook", startrow=0)
+        export_df.to_excel(writer, index=False, sheet_name="Codebook", startrow=0)
 
         workbook = writer.book
         worksheet = writer.sheets["Codebook"]
@@ -420,29 +651,35 @@ def dataframe_to_excel(df):
             "valign": "top",
         })
 
-        bold_question_format = workbook.add_format({
+        bold_main_question_format = workbook.add_format({
             "bold": True,
             "text_wrap": True,
             "valign": "top",
         })
 
         # Rewrite headers with formatting.
-        for col_num, col_name in enumerate(core_df.columns):
+        for col_num, col_name in enumerate(export_df.columns):
             worksheet.write(0, col_num, col_name, header_format)
 
         # Rewrite cells with formatting.
-        for row_num, row in core_df.iterrows():
+        for row_num, row in export_df.iterrows():
             excel_row = row_num + 1
 
-            for col_num, col_name in enumerate(core_df.columns):
+            is_main_question = main_question_flags[row_num]
+
+            for col_num, col_name in enumerate(export_df.columns):
                 value = row[col_name]
 
                 if pd.isna(value):
                     value = ""
 
-                # Bold non-empty question text.
-                if col_name == "QUESTION" and str(value).strip() != "":
-                    worksheet.write(excel_row, col_num, value, bold_question_format)
+                # Bold only the main question's VARIABLE NAME and QUESTION.
+                if (
+                    is_main_question
+                    and col_name in ["VARIABLE NAME", "QUESTION"]
+                    and str(value).strip() != ""
+                ):
+                    worksheet.write(excel_row, col_num, value, bold_main_question_format)
                 else:
                     worksheet.write(excel_row, col_num, value, normal_format)
 
@@ -486,14 +723,17 @@ if uploaded_file is not None:
 
     st.write(
         "You can edit the table below before downloading. "
-        "One empty row is added between questions."
+        "The app attempts to follow Qualtrics survey/block order when available."
     )
 
     edited_df = st.data_editor(
         codebook_df,
         use_container_width=True,
         num_rows="dynamic",
-        height=500
+        height=500,
+        column_config={
+            "IS MAIN QUESTION": None
+        }
     )
 
     st.subheader("Download")
@@ -508,15 +748,6 @@ if uploaded_file is not None:
         data=csv_data,
         file_name="codebook.csv",
         mime="text/csv"
-    )
-
-    excel_data = dataframe_to_excel(edited_df)
-
-    st.download_button(
-        label="Download codebook as Excel with bold question text",
-        data=excel_data,
-        file_name="codebook.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
     full_csv_data = edited_df.to_csv(index=False).encode("utf-8")
