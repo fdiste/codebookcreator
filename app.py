@@ -14,7 +14,13 @@ st.write(
     "Upload a Qualtrics `.qsf` file. This app will create a draft codebook "
     "with VARIABLE NAME, QUESTION, VALUE, and LABEL columns."
 )
-
+st.info(
+    "Privacy note: Uploaded QSF files are processed in memory by this app and "
+    "are not intentionally saved by the app code. If this app is hosted on "
+    "Streamlit Cloud, uploaded files are still temporarily processed by "
+    "Streamlit's servers. Do not upload sensitive or restricted survey "
+    "instruments unless this app is running in an approved environment."
+)
 
 # ------------------------------------------------------------
 # Helper functions
