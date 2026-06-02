@@ -1,5 +1,6 @@
 import json
 import re
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +15,7 @@ st.write(
     "Upload a Qualtrics `.qsf` file. This app will create a draft codebook "
     "with VARIABLE NAME, QUESTION, VALUE, and LABEL columns."
 )
+
 st.info(
     "Privacy note: Uploaded QSF files are processed in memory by this app and "
     "are not intentionally saved by the app code. If this app is hosted on "
@@ -21,6 +23,7 @@ st.info(
     "Streamlit's servers. Do not upload sensitive or restricted survey "
     "instruments unless this app is running in an approved environment."
 )
+
 
 # ------------------------------------------------------------
 # Helper functions
@@ -45,11 +48,8 @@ def clean_html(text):
 
 def get_choice_variable_name(payload, base_variable_name, choice_id):
     """
-    For multi-select questions, Qualtrics may store custom variable names
-    for each answer option in different places. This checks common locations.
-
-    These names are often created in Qualtrics by changing variable naming
-    for each answer option.
+    For multi-select and matrix questions, Qualtrics may store custom variable names
+    for each answer option or matrix row in different places.
     """
 
     choice_id = str(choice_id)
@@ -79,28 +79,97 @@ def get_choice_variable_name(payload, base_variable_name, choice_id):
     return f"{base_variable_name}_{choice_id}"
 
 
-def blank_repeated_values(df):
+def blank_row():
     """
-    Makes the downloaded codebook prettier by blanking repeated VARIABLE NAME
-    and QUESTION values after the first row.
+    Creates an empty row between questions.
     """
-    pretty_df = df.copy()
+    return {
+        "VARIABLE NAME": "",
+        "QUESTION": "",
+        "VALUE": "",
+        "LABEL": "",
+        "QUESTION TYPE": "",
+        "SELECTOR": "",
+        "QID": "",
+    }
 
-    for column in ["VARIABLE NAME", "QUESTION"]:
-        if column in pretty_df.columns:
-            pretty_df.loc[
-                pretty_df[column] == pretty_df[column].shift(),
-                column
-            ] = ""
 
-    return pretty_df
+def make_row(
+    variable_name,
+    question,
+    value,
+    label,
+    question_type,
+    selector,
+    qid
+):
+    """
+    Creates one standard codebook row.
+    """
+    return {
+        "VARIABLE NAME": variable_name,
+        "QUESTION": question,
+        "VALUE": value,
+        "LABEL": label,
+        "QUESTION TYPE": question_type,
+        "SELECTOR": selector,
+        "QID": qid,
+    }
+
+
+def combine_left_and_right(left_items, right_items, question_type, selector, qid):
+    """
+    Combines left-side variable/question items with right-side value/label items.
+
+    This is useful for matrix and multi-select questions where the left side
+    lists variables/items and the right side lists a shared response scale.
+
+    Example output:
+
+    VARIABLE NAME    QUESTION                 VALUE    LABEL
+    Prices           Agreement question        1       Strongly disagree
+    PricesHigh       Prices are higher...      2       Disagree
+    PricesQuality    Quality is good...        3       Neither agree nor disagree
+                                              4       Agree
+                                              5       Strongly agree
+    """
+    rows = []
+
+    max_rows = max(len(left_items), len(right_items))
+
+    for i in range(max_rows):
+        if i < len(left_items):
+            variable_name = left_items[i].get("VARIABLE NAME", "")
+            question = left_items[i].get("QUESTION", "")
+        else:
+            variable_name = ""
+            question = ""
+
+        if i < len(right_items):
+            value = right_items[i].get("VALUE", "")
+            label = right_items[i].get("LABEL", "")
+        else:
+            value = ""
+            label = ""
+
+        rows.append(make_row(
+            variable_name=variable_name,
+            question=question,
+            value=value,
+            label=label,
+            question_type=question_type,
+            selector=selector,
+            qid=qid
+        ))
+
+    return rows
 
 
 def parse_qsf(qsf_json):
     """
     Reads a Qualtrics QSF JSON file and creates codebook rows.
     """
-    rows = []
+    all_rows = []
 
     survey_elements = qsf_json.get("SurveyElements", [])
 
@@ -123,6 +192,8 @@ def parse_qsf(qsf_json):
 
         question_text = clean_html(payload.get("QuestionText", ""))
 
+        question_rows = []
+
         # ------------------------------------------------------------
         # Multiple choice questions
         # ------------------------------------------------------------
@@ -135,30 +206,15 @@ def parse_qsf(qsf_json):
             is_multi_select = str(selector).upper().startswith("MA")
 
             if is_multi_select:
-                # Parent row for the overall multi-select question.
-                # Put the Yes/No coding here only once.
-                rows.append({
-                    "VARIABLE NAME": variable_name,
-                    "QUESTION": question_text,
-                    "VALUE": "1",
-                    "LABEL": "Yes",
-                    "QUESTION TYPE": question_type,
-                    "SELECTOR": selector,
-                    "QID": qid,
-                })
+                # LEFT SIDE:
+                # Parent question first, then each option's variable name.
+                left_items = [
+                    {
+                        "VARIABLE NAME": variable_name,
+                        "QUESTION": question_text,
+                    }
+                ]
 
-                rows.append({
-                    "VARIABLE NAME": variable_name,
-                    "QUESTION": question_text,
-                    "VALUE": "0",
-                    "LABEL": "No",
-                    "QUESTION TYPE": question_type,
-                    "SELECTOR": selector,
-                    "QID": qid,
-                })
-
-                # Then list each response option's exported variable name.
-                # Do not repeat 1/0 coding for every option.
                 for choice_id, choice_info in choices.items():
                     option_variable_name = get_choice_variable_name(
                         payload,
@@ -168,48 +224,77 @@ def parse_qsf(qsf_json):
 
                     option_label = clean_html(choice_info.get("Display", ""))
 
-                    rows.append({
+                    left_items.append({
                         "VARIABLE NAME": option_variable_name,
                         "QUESTION": option_label,
-                        "VALUE": "",
-                        "LABEL": "",
-                        "QUESTION TYPE": question_type,
-                        "SELECTOR": selector,
-                        "QID": qid,
                     })
+
+                # RIGHT SIDE:
+                # Shared Yes/No coding listed once.
+                right_items = [
+                    {
+                        "VALUE": "1",
+                        "LABEL": "Yes",
+                    },
+                    {
+                        "VALUE": "0",
+                        "LABEL": "No",
+                    }
+                ]
+
+                question_rows.extend(
+                    combine_left_and_right(
+                        left_items=left_items,
+                        right_items=right_items,
+                        question_type=question_type,
+                        selector=selector,
+                        qid=qid
+                    )
+                )
 
             else:
                 # Regular single-choice question.
-                # Use recode values if Qualtrics provides them.
+                # No extra parent/question-only row is added.
+                # The first value/label is on the same row as the question.
+                first_row = True
+
                 for choice_id, choice_info in choices.items():
                     value = recode_values.get(str(choice_id), str(choice_id))
                     label = clean_html(choice_info.get("Display", ""))
 
-                    rows.append({
-                        "VARIABLE NAME": variable_name,
-                        "QUESTION": question_text,
-                        "VALUE": value,
-                        "LABEL": label,
-                        "QUESTION TYPE": question_type,
-                        "SELECTOR": selector,
-                        "QID": qid,
-                    })
+                    if first_row:
+                        row_variable_name = variable_name
+                        row_question = question_text
+                        first_row = False
+                    else:
+                        row_variable_name = ""
+                        row_question = ""
+
+                    question_rows.append(make_row(
+                        variable_name=row_variable_name,
+                        question=row_question,
+                        value=value,
+                        label=label,
+                        question_type=question_type,
+                        selector=selector,
+                        qid=qid
+                    ))
 
         # ------------------------------------------------------------
         # Open text questions
         # ------------------------------------------------------------
         elif question_type == "TE":
-            rows.append({
-                "VARIABLE NAME": variable_name,
-                "QUESTION": question_text,
-                "VALUE": "[open-ended]",
-                "LABEL": "",
-                "QUESTION TYPE": question_type,
-                "SELECTOR": selector,
-                "QID": qid,
-            })
+            question_rows.append(make_row(
+                variable_name=variable_name,
+                question=question_text,
+                value="[open-ended]",
+                label="",
+                question_type=question_type,
+                selector=selector,
+                qid=qid
+            ))
 
-         # ------------------------------------------------------------
+        # ------------------------------------------------------------
         # Matrix/table questions
         # ------------------------------------------------------------
         elif question_type == "Matrix":
@@ -217,14 +302,14 @@ def parse_qsf(qsf_json):
             answers = payload.get("Answers", {})
             recode_values = payload.get("RecodeValues", {})
 
-            # Build the left side of the codebook:
-            # parent matrix variable first, then each matrix row variable.
-            matrix_variables = []
-
-            matrix_variables.append({
-                "VARIABLE NAME": variable_name,
-                "QUESTION": question_text,
-            })
+            # LEFT SIDE:
+            # Parent matrix question first, then each matrix row variable.
+            left_items = [
+                {
+                    "VARIABLE NAME": variable_name,
+                    "QUESTION": question_text,
+                }
+            ]
 
             for choice_id, choice_info in choices.items():
                 row_text = clean_html(choice_info.get("Display", ""))
@@ -235,82 +320,142 @@ def parse_qsf(qsf_json):
                     choice_id
                 )
 
-                matrix_variables.append({
+                left_items.append({
                     "VARIABLE NAME": matrix_variable_name,
                     "QUESTION": row_text,
                 })
 
-            # Build the right side of the codebook:
-            # values and labels listed once.
-            scale_values = []
+            # RIGHT SIDE:
+            # Matrix scale values/labels listed once.
+            right_items = []
 
             for answer_id, answer_info in answers.items():
                 value = recode_values.get(str(answer_id), str(answer_id))
                 label = clean_html(answer_info.get("Display", ""))
 
-                scale_values.append({
+                right_items.append({
                     "VALUE": value,
                     "LABEL": label,
                 })
 
-            # Combine the left side and right side row-by-row.
-            # This keeps matrix variables directly under the parent variable
-            # while listing the value/label scale only once.
-            max_rows = max(len(matrix_variables), len(scale_values))
+            question_rows.extend(
+                combine_left_and_right(
+                    left_items=left_items,
+                    right_items=right_items,
+                    question_type=question_type,
+                    selector=selector,
+                    qid=qid
+                )
+            )
 
-            for i in range(max_rows):
-                if i < len(matrix_variables):
-                    var_name = matrix_variables[i]["VARIABLE NAME"]
-                    q_text = matrix_variables[i]["QUESTION"]
-                else:
-                    var_name = ""
-                    q_text = ""
-
-                if i < len(scale_values):
-                    value = scale_values[i]["VALUE"]
-                    label = scale_values[i]["LABEL"]
-                else:
-                    value = ""
-                    label = ""
-
-                rows.append({
-                    "VARIABLE NAME": var_name,
-                    "QUESTION": q_text,
-                    "VALUE": value,
-                    "LABEL": label,
-                    "QUESTION TYPE": question_type,
-                    "SELECTOR": selector,
-                    "QID": qid,
-                })
         # ------------------------------------------------------------
         # Drill down questions - basic placeholder/fallback
         # ------------------------------------------------------------
         elif question_type in ["DD", "DrillDown"]:
-            rows.append({
-                "VARIABLE NAME": variable_name,
-                "QUESTION": question_text,
-                "VALUE": "",
-                "LABEL": "[drill-down question - needs review]",
-                "QUESTION TYPE": question_type,
-                "SELECTOR": selector,
-                "QID": qid,
-            })
+            question_rows.append(make_row(
+                variable_name=variable_name,
+                question=question_text,
+                value="",
+                label="[drill-down question - needs review]",
+                question_type=question_type,
+                selector=selector,
+                qid=qid
+            ))
 
         # ------------------------------------------------------------
         # Other question types
         # ------------------------------------------------------------
         else:
-            rows.append({
-                "VARIABLE NAME": variable_name,
-                "QUESTION": question_text,
-                "VALUE": "",
-                "LABEL": "",
-                "QUESTION TYPE": question_type,
-                "SELECTOR": selector,
-                "QID": qid,
-            })
+            question_rows.append(make_row(
+                variable_name=variable_name,
+                question=question_text,
+                value="",
+                label="",
+                question_type=question_type,
+                selector=selector,
+                qid=qid
+            ))
 
-    return pd.DataFrame(rows)
+        # Add this question's rows to the full codebook.
+        if question_rows:
+            all_rows.extend(question_rows)
+
+            # Add one empty row between questions.
+            all_rows.append(blank_row())
+
+    # Remove final trailing blank row, if present.
+    if all_rows and all_rows[-1] == blank_row():
+        all_rows.pop()
+
+    return pd.DataFrame(all_rows)
+
+
+def dataframe_to_excel(df):
+    """
+    Creates an Excel file with bold question text.
+    CSV cannot support bold formatting, so this is for Excel downloads.
+    """
+    output = BytesIO()
+
+    core_columns = ["VARIABLE NAME", "QUESTION", "VALUE", "LABEL"]
+    core_df = df[core_columns].copy()
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        core_df.to_excel(writer, index=False, sheet_name="Codebook", startrow=0)
+
+        workbook = writer.book
+        worksheet = writer.sheets["Codebook"]
+
+        header_format = workbook.add_format({
+            "bold": True,
+            "bg_color": "#70AD47",
+            "font_color": "black",
+            "border": 1,
+            "align": "left",
+            "valign": "top",
+        })
+
+        normal_format = workbook.add_format({
+            "text_wrap": True,
+            "valign": "top",
+        })
+
+        bold_question_format = workbook.add_format({
+            "bold": True,
+            "text_wrap": True,
+            "valign": "top",
+        })
+
+        # Rewrite headers with formatting.
+        for col_num, col_name in enumerate(core_df.columns):
+            worksheet.write(0, col_num, col_name, header_format)
+
+        # Rewrite cells with formatting.
+        for row_num, row in core_df.iterrows():
+            excel_row = row_num + 1
+
+            for col_num, col_name in enumerate(core_df.columns):
+                value = row[col_name]
+
+                if pd.isna(value):
+                    value = ""
+
+                # Bold non-empty question text.
+                if col_name == "QUESTION" and str(value).strip() != "":
+                    worksheet.write(excel_row, col_num, value, bold_question_format)
+                else:
+                    worksheet.write(excel_row, col_num, value, normal_format)
+
+        # Column widths.
+        worksheet.set_column("A:A", 28, normal_format)
+        worksheet.set_column("B:B", 75, normal_format)
+        worksheet.set_column("C:C", 14, normal_format)
+        worksheet.set_column("D:D", 45, normal_format)
+
+        worksheet.freeze_panes(1, 0)
+
+    output.seek(0)
+    return output
 
 
 # ------------------------------------------------------------
@@ -341,8 +486,7 @@ if uploaded_file is not None:
 
     st.write(
         "You can edit the table below before downloading. "
-        "The download can optionally blank repeated variable names and questions "
-        "to make the codebook easier to read."
+        "One empty row is added between questions."
     )
 
     edited_df = st.data_editor(
@@ -354,20 +498,8 @@ if uploaded_file is not None:
 
     st.subheader("Download")
 
-    blank_repeats = st.checkbox(
-        "Blank repeated variable names and questions in downloaded file",
-        value=True
-    )
-
     core_columns = ["VARIABLE NAME", "QUESTION", "VALUE", "LABEL"]
-
-    if blank_repeats:
-        download_df = blank_repeated_values(edited_df)
-    else:
-        download_df = edited_df.copy()
-
-    # Only include the four main codebook columns in the CSV download.
-    core_df = download_df[core_columns]
+    core_df = edited_df[core_columns]
 
     csv_data = core_df.to_csv(index=False).encode("utf-8")
 
@@ -378,8 +510,16 @@ if uploaded_file is not None:
         mime="text/csv"
     )
 
-    # Optional: also allow downloading the fuller version with metadata.
-    full_csv_data = download_df.to_csv(index=False).encode("utf-8")
+    excel_data = dataframe_to_excel(edited_df)
+
+    st.download_button(
+        label="Download codebook as Excel with bold question text",
+        data=excel_data,
+        file_name="codebook.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    full_csv_data = edited_df.to_csv(index=False).encode("utf-8")
 
     st.download_button(
         label="Download full codebook with metadata as CSV",
