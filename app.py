@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 from io import BytesIO
 
 import pandas as pd
@@ -17,13 +18,20 @@ st.write(
     "SPSS VALUE LABELS syntax for each variable."
 )
 
-st.info(
-    "Privacy note: Uploaded QSF files are processed in memory by this app and "
-    "are not intentionally saved by the app code. If this app is hosted on "
-    "Streamlit Cloud, uploaded files are still temporarily processed by "
-    "Streamlit's servers. Do not upload sensitive or restricted survey "
-    "instruments unless this app is running in an approved environment."
-)
+if sys.platform == "emscripten":
+    # Running in the browser (GitHub Pages via stlite / Pyodide).
+    st.info(
+        "Privacy note: This app runs entirely in your web browser. Your QSF "
+        "file is read on your own computer and is never uploaded to a server."
+    )
+else:
+    st.info(
+        "Privacy note: Uploaded QSF files are processed in memory by this app and "
+        "are not intentionally saved by the app code. If this app is hosted on "
+        "Streamlit Cloud, uploaded files are still temporarily processed by "
+        "Streamlit's servers. Do not upload sensitive or restricted survey "
+        "instruments unless this app is running in an approved environment."
+    )
 
 
 # ------------------------------------------------------------

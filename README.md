@@ -2,6 +2,10 @@
 
 This Streamlit app creates a simple evaluation codebook from a Qualtrics `.qsf` file (survey export file).
 
+## ▶ Use the app: https://fdiste.github.io/codebookcreator/
+
+No install needed. The app runs entirely in your web browser, so your `.qsf` file is never uploaded to a server. The first load takes 10–20 seconds while it sets up.
+
 Upload a `.qsf` file to get an editable draft codebook with these columns:
 
 - **VARIABLE NAME**, **QUESTION**, **VALUE**, **LABEL**
@@ -11,7 +15,11 @@ Upload a `.qsf` file to get an editable draft codebook with these columns:
 
 Downloads: Excel (`.xlsx`), CSV, full CSV with metadata, and an SPSS syntax file (`.sps`) containing all the value labels.
 
-## Run locally
+## How it's hosted
+
+`index.html` uses [stlite](https://github.com/whitphx/stlite) to run `app.py` in the browser, and GitHub Pages serves it from the `main` branch. To update the public app, edit `app.py` and push.
+
+## Run locally (optional)
 
 ```
 pip install -r requirements.txt
