@@ -1,5 +1,5 @@
-streamlit
+streamlit>=1.50
 pandas
-beautifulsoup4==4.14.3
+beautifulsoup4>=4.12
 xlsxwriter
 openpyxl

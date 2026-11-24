@@ -13,7 +13,8 @@ st.title("Qualtrics QSF to Codebook Generator")
 
 st.write(
     "Upload a Qualtrics `.qsf` file. This app will create a draft codebook "
-    "with VARIABLE NAME, QUESTION, VALUE, and LABEL columns."
+    "with VARIABLE NAME, QUESTION, VALUE, and LABEL columns, plus ready-to-run "
+    "SPSS VALUE LABELS syntax for each variable."
 )
 
 st.info(
@@ -79,6 +80,12 @@ def get_blocks_from_qsf(qsf_json):
             if payload.get("BlockElements"):
                 blocks.append(payload)
 
+            # Very common: Payload is a dict keyed by "1", "2", ... where
+            # each value is a block object.
+            for value in payload.values():
+                if isinstance(value, dict) and "BlockElements" in value:
+                    blocks.append(value)
+
     return blocks
 
 
@@ -103,7 +110,9 @@ def get_block_ids_from_survey_flow(qsf_json):
             item_type = item.get("Type")
             item_id = item.get("ID")
 
-            if item_type == "Block" and item_id:
+            # Qualtrics uses "Standard" for regular blocks and "Block" for
+            # the default block.
+            if item_type in ("Block", "Standard") and item_id:
                 if item_id not in block_ids:
                     block_ids.append(item_id)
 
@@ -128,6 +137,22 @@ def get_block_ids_from_survey_flow(qsf_json):
     return block_ids
 
 
+def get_trashed_question_ids(qsf_json):
+    """
+    Returns the QIDs of questions sitting in the Qualtrics Trash block, so
+    deleted questions are left out of the codebook.
+    """
+    trashed = set()
+
+    for block in get_blocks_from_qsf(qsf_json):
+        if isinstance(block, dict) and block.get("Type") == "Trash":
+            for block_element in block.get("BlockElements", []) or []:
+                if isinstance(block_element, dict) and block_element.get("QuestionID"):
+                    trashed.add(block_element["QuestionID"])
+
+    return trashed
+
+
 def get_ordered_question_ids(qsf_json):
     """
     Attempts to get question order from Qualtrics blocks and survey flow.
@@ -147,6 +172,10 @@ def get_ordered_question_ids(qsf_json):
 
     for block in blocks:
         if not isinstance(block, dict):
+            continue
+
+        # Skip the Trash block (deleted questions).
+        if block.get("Type") == "Trash":
             continue
 
         block_id = block.get("ID") or block.get("BlockID")
@@ -192,6 +221,57 @@ def get_ordered_question_ids(qsf_json):
 # Helper functions: codebook rows
 # ------------------------------------------------------------
 
+def as_dict(value):
+    """
+    Qualtrics sometimes stores Choices/Answers/RecodeValues as a list instead
+    of a dict (for example, an empty list when there are none). Normalize to a
+    dict keyed by string IDs so the rest of the code can use .items().
+    """
+    if isinstance(value, dict):
+        return {str(k): v for k, v in value.items()}
+
+    if isinstance(value, list):
+        return {
+            str(i + 1): v
+            for i, v in enumerate(value)
+            if v not in (None, "", [])
+        }
+
+    return {}
+
+
+def ordered_items(items, order=None):
+    """
+    Returns (id, info) pairs following Qualtrics' ChoiceOrder/AnswerOrder
+    when it is available, then any remaining items.
+    """
+    items = as_dict(items)
+    result = []
+    seen = set()
+
+    if isinstance(order, list):
+        for item_id in order:
+            item_id = str(item_id)
+            if item_id in items and item_id not in seen:
+                result.append((item_id, items[item_id]))
+                seen.add(item_id)
+
+    for item_id, info in items.items():
+        if item_id not in seen:
+            result.append((item_id, info))
+
+    return result
+
+
+def display_text(info):
+    """
+    Gets the display text for a choice/answer, which may be a dict or a string.
+    """
+    if isinstance(info, dict):
+        return clean_html(info.get("Display", ""))
+    return clean_html(info)
+
+
 def get_choice_variable_name(payload, base_variable_name, choice_id):
     """
     For multi-select and matrix questions, Qualtrics may store custom variable
@@ -213,7 +293,7 @@ def get_choice_variable_name(payload, base_variable_name, choice_id):
             return str(choice_export_tags[choice_id])
 
     # Common location 3: inside the Choices object
-    choices = payload.get("Choices", {})
+    choices = as_dict(payload.get("Choices", {}))
     choice_info = choices.get(choice_id, {})
 
     if isinstance(choice_info, dict):
@@ -334,12 +414,17 @@ def parse_qsf(qsf_json):
     question_elements_by_qid = {}
     raw_question_elements = []
 
+    trashed_qids = get_trashed_question_ids(qsf_json)
+
     for element in qsf_json.get("SurveyElements", []):
         if element.get("Element") != "SQ":
             continue
 
-        payload = element.get("Payload", {})
+        payload = element.get("Payload") or {}
         qid = payload.get("QuestionID") or element.get("PrimaryAttribute")
+
+        if qid in trashed_qids:
+            continue
 
         if qid:
             question_elements_by_qid[qid] = element
@@ -360,7 +445,7 @@ def parse_qsf(qsf_json):
         already_added_qids = set(ordered_qids)
 
         for element in raw_question_elements:
-            payload = element.get("Payload", {})
+            payload = element.get("Payload") or {}
             qid = payload.get("QuestionID") or element.get("PrimaryAttribute")
 
             if qid not in already_added_qids:
@@ -371,7 +456,7 @@ def parse_qsf(qsf_json):
 
     # Parse questions in order.
     for element in ordered_elements:
-        payload = element.get("Payload", {})
+        payload = element.get("Payload") or {}
 
         qid = payload.get("QuestionID") or element.get("PrimaryAttribute", "")
         question_type = payload.get("QuestionType", "")
@@ -391,8 +476,11 @@ def parse_qsf(qsf_json):
         # Multiple choice questions
         # ------------------------------------------------------------
         if question_type == "MC":
-            choices = payload.get("Choices", {})
-            recode_values = payload.get("RecodeValues", {})
+            choices = ordered_items(
+                payload.get("Choices", {}),
+                payload.get("ChoiceOrder")
+            )
+            recode_values = as_dict(payload.get("RecodeValues", {}))
 
             # Qualtrics selectors that start with MA are usually
             # multi-answer/check-all-that-apply.
@@ -409,14 +497,14 @@ def parse_qsf(qsf_json):
                     }
                 ]
 
-                for choice_id, choice_info in choices.items():
+                for choice_id, choice_info in choices:
                     option_variable_name = get_choice_variable_name(
                         payload,
                         variable_name,
                         choice_id
                     )
 
-                    option_label = clean_html(choice_info.get("Display", ""))
+                    option_label = display_text(choice_info)
 
                     left_items.append({
                         "VARIABLE NAME": option_variable_name,
@@ -453,9 +541,9 @@ def parse_qsf(qsf_json):
                 # The first value/label is on the same row as the question.
                 first_row = True
 
-                for choice_id, choice_info in choices.items():
-                    value = recode_values.get(str(choice_id), str(choice_id))
-                    label = clean_html(choice_info.get("Display", ""))
+                for choice_id, choice_info in choices:
+                    value = str(recode_values.get(str(choice_id), choice_id))
+                    label = display_text(choice_info)
 
                     if first_row:
                         row_variable_name = variable_name
@@ -497,9 +585,15 @@ def parse_qsf(qsf_json):
         # Matrix/table questions
         # ------------------------------------------------------------
         elif question_type == "Matrix":
-            choices = payload.get("Choices", {})
-            answers = payload.get("Answers", {})
-            recode_values = payload.get("RecodeValues", {})
+            choices = ordered_items(
+                payload.get("Choices", {}),
+                payload.get("ChoiceOrder")
+            )
+            answers = ordered_items(
+                payload.get("Answers", {}),
+                payload.get("AnswerOrder")
+            )
+            recode_values = as_dict(payload.get("RecodeValues", {}))
 
             # LEFT SIDE:
             # Parent matrix question first, then each matrix row variable.
@@ -511,8 +605,8 @@ def parse_qsf(qsf_json):
                 }
             ]
 
-            for choice_id, choice_info in choices.items():
-                row_text = clean_html(choice_info.get("Display", ""))
+            for choice_id, choice_info in choices:
+                row_text = display_text(choice_info)
 
                 matrix_variable_name = get_choice_variable_name(
                     payload,
@@ -530,9 +624,9 @@ def parse_qsf(qsf_json):
             # Matrix scale values/labels listed once.
             right_items = []
 
-            for answer_id, answer_info in answers.items():
-                value = recode_values.get(str(answer_id), str(answer_id))
-                label = clean_html(answer_info.get("Display", ""))
+            for answer_id, answer_info in answers:
+                value = str(recode_values.get(str(answer_id), answer_id))
+                label = display_text(answer_info)
 
                 right_items.append({
                     "VALUE": value,
@@ -607,7 +701,156 @@ def parse_qsf(qsf_json):
     if all_rows and all_rows[-1] == blank_row():
         all_rows.pop()
 
-    return pd.DataFrame(all_rows)
+    df = pd.DataFrame(all_rows)
+
+    if df.empty:
+        return df
+
+    df = add_spss_value_labels(df)
+
+    # Put the SPSS column right after LABEL.
+    other_columns = [col for col in df.columns if col not in CORE_COLUMNS]
+    return df[CORE_COLUMNS + other_columns]
+
+
+# ------------------------------------------------------------
+# SPSS value labels
+# ------------------------------------------------------------
+
+CORE_COLUMNS = ["VARIABLE NAME", "QUESTION", "VALUE", "LABEL", "SPSS VALUE LABELS"]
+
+
+def cell_text(value):
+    """
+    Converts a table cell to clean text (treats NaN/None as empty).
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def spss_quote(text):
+    """
+    Wraps text in single quotes for SPSS syntax, doubling any inner quotes.
+    """
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def spss_value(value):
+    """
+    Numeric codes are written bare; anything else is quoted (string variable).
+    """
+    value = str(value).strip()
+    if re.fullmatch(r"-?\d+(\.\d+)?", value):
+        return value
+    return spss_quote(value)
+
+
+def add_spss_value_labels(df):
+    """
+    Adds a SPSS VALUE LABELS column containing a ready-to-run SPSS command
+    for each question, e.g.:
+
+        VALUE LABELS gender 1 'Man' 2 'Woman' 99 'Prefer not to say'.
+
+    For matrix and multi-select questions, every item variable shares the
+    same labels, so they are listed together in one command:
+
+        VALUE LABELS agree_1 agree_2 1 'Disagree' 2 'Neutral' 3 'Agree'.
+
+    The command is placed on the question's main row. Questions are found
+    by the blank rows that separate them, so this also works on a table
+    the user has edited.
+    """
+    df = df.reset_index(drop=True).copy()
+    spss_labels = [""] * len(df)
+
+    def is_blank(row):
+        return all(
+            cell_text(row.get(col)) == ""
+            for col in ["VARIABLE NAME", "QUESTION", "VALUE", "LABEL"]
+        )
+
+    groups = []
+    current = []
+
+    for i, row in df.iterrows():
+        if is_blank(row):
+            if current:
+                groups.append(current)
+            current = []
+        else:
+            current.append(i)
+
+    if current:
+        groups.append(current)
+
+    for group in groups:
+        main_index = None
+        item_variables = []
+        value_labels = []
+
+        for i in group:
+            row = df.loc[i]
+            name = cell_text(row.get("VARIABLE NAME"))
+            is_main = cell_text(row.get("IS MAIN QUESTION")).lower() == "true"
+
+            if is_main and main_index is None:
+                main_index = i
+            elif name:
+                item_variables.append(name)
+
+            value = cell_text(row.get("VALUE"))
+            label = cell_text(row.get("LABEL"))
+
+            # Skip placeholders such as [open-ended].
+            if value and not (value.startswith("[") and value.endswith("]")):
+                value_labels.append((value, label))
+
+        if main_index is None:
+            # No row flagged as the main question: treat the first row as main.
+            main_index = group[0]
+            first_name = cell_text(df.loc[main_index].get("VARIABLE NAME"))
+            if item_variables and item_variables[0] == first_name:
+                item_variables.pop(0)
+
+        main_name = cell_text(df.loc[main_index].get("VARIABLE NAME"))
+
+        # Matrix / multi-select: label each item variable.
+        # Single questions: label the question's own variable.
+        variables = item_variables or ([main_name] if main_name else [])
+
+        if not variables or not value_labels:
+            continue
+
+        pairs = " ".join(
+            f"{spss_value(value)} {spss_quote(label)}"
+            for value, label in value_labels
+        )
+
+        spss_labels[main_index] = f"VALUE LABELS {' '.join(variables)} {pairs}."
+
+    df["SPSS VALUE LABELS"] = spss_labels
+    return df
+
+
+def build_spss_syntax(df):
+    """
+    Combines every VALUE LABELS command into one SPSS syntax (.sps) file.
+    """
+    commands = [
+        cell_text(value)
+        for value in df.get("SPSS VALUE LABELS", [])
+        if cell_text(value)
+    ]
+
+    header = "* SPSS value labels generated by the QSF Codebook Generator.\n"
+    return header + "\n".join(commands) + "\n"
 
 
 # ------------------------------------------------------------
@@ -623,11 +866,14 @@ def dataframe_to_excel(df):
     """
     output = BytesIO()
 
-    core_columns = ["VARIABLE NAME", "QUESTION", "VALUE", "LABEL"]
-    export_df = df[core_columns].copy()
+    df = df.reset_index(drop=True)
+    export_df = df[CORE_COLUMNS].copy()
 
     if "IS MAIN QUESTION" in df.columns:
-        main_question_flags = df["IS MAIN QUESTION"].fillna(False).astype(bool).tolist()
+        main_question_flags = [
+            cell_text(flag).lower() == "true"
+            for flag in df["IS MAIN QUESTION"]
+        ]
     else:
         main_question_flags = [False] * len(df)
 
@@ -688,6 +934,7 @@ def dataframe_to_excel(df):
         worksheet.set_column("B:B", 75, normal_format)
         worksheet.set_column("C:C", 14, normal_format)
         worksheet.set_column("D:D", 45, normal_format)
+        worksheet.set_column("E:E", 70, normal_format)
 
         worksheet.freeze_panes(1, 0)
 
@@ -728,20 +975,49 @@ if uploaded_file is not None:
 
     edited_df = st.data_editor(
         codebook_df,
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         height=500,
         column_config={
-            "IS MAIN QUESTION": None
+            "IS MAIN QUESTION": None,
+            "SPSS VALUE LABELS": st.column_config.TextColumn(
+                "SPSS VALUE LABELS",
+                help=(
+                    "Generated automatically from VALUE and LABEL. "
+                    "Edit those columns and the downloads will use the "
+                    "updated labels."
+                ),
+                disabled=True,
+                width="large",
+            ),
         }
     )
 
+    # Rebuild the SPSS labels from the edited table so downloads reflect edits.
+    edited_df = add_spss_value_labels(edited_df)
+
+    st.subheader("SPSS value labels syntax")
+
+    spss_syntax = build_spss_syntax(edited_df)
+
+    st.write(
+        "Paste this into an SPSS syntax window (or download the .sps file) "
+        "to apply value labels to your data."
+    )
+    st.code(spss_syntax, language="sql")
+
     st.subheader("Download")
 
-    core_columns = ["VARIABLE NAME", "QUESTION", "VALUE", "LABEL"]
-    core_df = edited_df[core_columns]
+    core_df = edited_df[CORE_COLUMNS]
 
-    csv_data = core_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download codebook as Excel",
+        data=dataframe_to_excel(edited_df),
+        file_name="codebook.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    csv_data = core_df.to_csv(index=False).encode("utf-8-sig")
 
     st.download_button(
         label="Download codebook as CSV",
@@ -750,13 +1026,20 @@ if uploaded_file is not None:
         mime="text/csv"
     )
 
-    full_csv_data = edited_df.to_csv(index=False).encode("utf-8")
+    full_csv_data = edited_df.to_csv(index=False).encode("utf-8-sig")
 
     st.download_button(
         label="Download full codebook with metadata as CSV",
         data=full_csv_data,
         file_name="codebook_full.csv",
         mime="text/csv"
+    )
+
+    st.download_button(
+        label="Download SPSS value labels syntax (.sps)",
+        data=spss_syntax.encode("utf-8"),
+        file_name="value_labels.sps",
+        mime="text/plain"
     )
 
 else:
