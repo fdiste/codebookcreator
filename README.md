@@ -1,6 +1,6 @@
 # QSF Codebook Generator
 
-This Streamlit app creates a simple evaluation codebook from a Qualtrics `.qsf` file (survey export file).
+This app creates a simple evaluation codebook from a Qualtrics `.qsf` file (survey export file).
 
 ## ▶ Use the app: https://fdiste.github.io/codebookcreator/
 
